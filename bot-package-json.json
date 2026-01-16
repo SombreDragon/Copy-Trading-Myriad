@@ -1,0 +1,28 @@
+{
+  "name": "arii-copy-trading-bot",
+  "version": "1.0.0",
+  "description": "Bot Telegram pour copier les bets d'Arii Defi sur Myriad (Abstract Chain)",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "crypto",
+    "trading",
+    "myriad",
+    "abstract"
+  ],
+  "author": "Votre Nom",
+  "license": "MIT",
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "ethers": "^6.13.2",
+    "axios": "^1.7.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
