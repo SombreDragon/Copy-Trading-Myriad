@@ -1,517 +1,510 @@
-// Bot Telegram pour Copy-Trading Arii Defi sur Myriad (Abstract Chain)
-// npm install node-telegram-bot-api ethers axios
+// Bot Telegram avec Monitoring Auto toutes les 5 minutes
+// npm install node-telegram-bot-api express axios cheerio
 
 const TelegramBot = require('node-telegram-bot-api');
-const { ethers } = require('ethers');
+const express = require('express');
 const axios = require('axios');
+const cheerio = require('cheerio');
 
 // ============ CONFIGURATION ============
 const TELEGRAM_BOT_TOKEN = '7425431970:AAE6-D_NWoD33h40qUfyF27RUmlvcCCyTHk';
-const ABSTRACT_RPC_URL = 'https://api.abs.xyz';
 const ARII_WALLET = '0x2993249a3d107b759c886a4bd4e02b70d471ea9b';
-const MYRIAD_PROFILE_URL = 'https://myriad.markets/profile/0x2993249a3d107b759c886a4bd4e02b70d471ea9b?tab=activity';
-const ABSTRACT_EXPLORER = 'https://abscan.org';
-
-// Port pour Render (Health Check)
+const MYRIAD_PROFILE_URL = `https://myriad.markets/profile/${ARII_WALLET}?tab=activity`;
+const CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes en millisecondes
 const PORT = process.env.PORT || 3000;
 
 // ============ INITIALISATION ============
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-const provider = new ethers.JsonRpcProvider(ABSTRACT_RPC_URL);
+const app = express();
 
-// Serveur HTTP simple pour health check Render
-const http = require('http');
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot Telegram Arii Copy Trader is running!\n');
-});
+app.use(express.json());
 
-server.listen(PORT, () => {
-    console.log(`🌐 Health check server running on port ${PORT}`);
-});
-
-// Stockage des utilisateurs et leurs préférences
+// Stockage
 const users = new Map();
-const activeBets = [];
+const knownBets = new Set(); // IDs des bets déjà vus
+let lastCheckTime = null;
+let lastBetDetected = null;
+let monitoringActive = false;
 
-// ============ FONCTIONS UTILITAIRES ============
+// ============ SCRAPING MYRIAD ============
 
-// Récupère les dernières activités d'Arii depuis Myriad
 async function fetchAriiActivity() {
     try {
-        // On va scraper la page de profil Myriad
+        console.log('🔍 Vérification de l\'activité d\'Arii...');
+        
         const response = await axios.get(MYRIAD_PROFILE_URL, {
-            timeout: 10000,
+            timeout: 15000,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
             }
         });
         
-        // Pour l'instant, on log et on retourne vide
-        // TODO: Parser le HTML pour extraire les bets
-        console.log('✅ Myriad profile accessible');
-        return [];
+        const $ = cheerio.load(response.data);
+        const bets = [];
+        
+        // Cherche les éléments de bet dans le HTML
+        // Note: La structure peut varier, on cherche des patterns communs
+        $('[data-testid*="bet"], [class*="bet"], [class*="trade"], [class*="position"]').each((i, elem) => {
+            try {
+                const $elem = $(elem);
+                const text = $elem.text();
+                const dataId = $elem.attr('data-id') || $elem.attr('id');
+                
+                // Extrait les infos du bet
+                if (text && (text.includes('ETH') || text.includes('USDC') || text.includes('bought') || text.includes('sold'))) {
+                    bets.push({
+                        id: dataId || `bet_${Date.now()}_${i}`,
+                        text: text.trim(),
+                        html: $elem.html(),
+                        timestamp: Date.now()
+                    });
+                }
+            } catch (err) {
+                console.log('⚠️ Erreur parsing bet:', err.message);
+            }
+        });
+        
+        console.log(`✅ ${bets.length} activités trouvées`);
+        return bets;
+        
     } catch (error) {
-        console.log('⚠️ Myriad inaccessible, fallback sur blockchain monitoring');
-        // Fallback: surveiller directement la blockchain
-        return await monitorBlockchain();
+        console.log('⚠️ Erreur scraping:', error.message);
+        return [];
     }
 }
 
-// Surveille la blockchain Abstract pour les transactions d'Arii
-async function monitorBlockchain() {
+function parseBetInfo(betData) {
+    // Extrait les infos pertinentes du texte
+    const text = betData.text;
+    
+    // Cherche le montant
+    const amountMatch = text.match(/(\d+\.?\d*)\s*(ETH|USDC|USD)/i);
+    const amount = amountMatch ? `${amountMatch[1]} ${amountMatch[2]}` : 'Montant inconnu';
+    
+    // Cherche le type d'action
+    const action = text.toLowerCase().includes('bought') ? 'Achat' : 
+                   text.toLowerCase().includes('sold') ? 'Vente' : 'Trade';
+    
+    // Cherche le marché (texte avant le montant généralement)
+    const marketMatch = text.split(/bought|sold|traded/i)[0].trim();
+    const market = marketMatch.slice(0, 100) || 'Marché non spécifié';
+    
+    return {
+        id: betData.id,
+        amount,
+        action,
+        market,
+        timestamp: betData.timestamp,
+        fullText: text
+    };
+}
+
+// ============ MONITORING AUTOMATIQUE ============
+
+async function startMonitoring() {
+    if (monitoringActive) {
+        console.log('⚠️ Monitoring déjà actif');
+        return;
+    }
+    
+    monitoringActive = true;
+    console.log('🚀 Monitoring automatique démarré!');
+    console.log(`⏱️ Vérification toutes les ${CHECK_INTERVAL / 60000} minutes`);
+    
+    // Première vérification immédiate
+    await checkForNewBets();
+    
+    // Puis vérifications régulières
+    setInterval(async () => {
+        await checkForNewBets();
+    }, CHECK_INTERVAL);
+}
+
+async function checkForNewBets() {
     try {
-        const latestBlock = await provider.getBlockNumber();
-        console.log(`📦 Dernier bloc: ${latestBlock}`);
+        lastCheckTime = new Date();
+        const activities = await fetchAriiActivity();
         
-        // On récupère seulement le bloc sans les transactions pour économiser les requêtes
-        const block = await provider.getBlock(latestBlock);
-        
-        if (!block) {
-            console.log('⚠️ Bloc vide ou inaccessible');
-            return [];
+        if (activities.length === 0) {
+            console.log('📭 Aucune activité détectée');
+            return;
         }
         
-        // Pour l'instant, on ne fetch pas toutes les transactions (trop lourd)
-        // On va plutôt surveiller les événements du wallet d'Arii
-        console.log(`✅ Bloc ${latestBlock} vérifié`);
-        return [];
+        // Vérifie les nouveaux bets
+        const newBets = activities.filter(bet => !knownBets.has(bet.id));
         
-    } catch (error) {
-        if (error.message.includes('missing')) {
-            console.log('⚠️ RPC temporairement inaccessible (normal)');
+        if (newBets.length > 0) {
+            console.log(`🆕 ${newBets.length} nouveau(x) bet(s) détecté(s)!`);
+            
+            for (const betData of newBets) {
+                knownBets.add(betData.id);
+                const betInfo = parseBetInfo(betData);
+                lastBetDetected = betInfo;
+                
+                // Notifie tous les utilisateurs
+                await notifyAllUsers(betInfo);
+            }
         } else {
-            console.log('⚠️ Erreur blockchain:', error.message.substring(0, 100));
+            console.log('✅ Aucun nouveau bet');
         }
-        return [];
-    }
-}
-
-// Analyse une transaction pour extraire les infos du bet
-function parseBetTransaction(tx) {
-    // Cette fonction devra être adaptée selon l'ABI des contrats Myriad
-    // Pour l'instant, on retourne les infos basiques
-    return {
-        id: tx.hash,
-        market: tx.to,
-        amount: tx.value,
-        timestamp: Date.now(),
-        explorerUrl: `${ABSTRACT_EXPLORER}/tx/${tx.hash}`
-    };
-}
-
-// Formate un message de notification de bet
-function formatBetNotification(bet) {
-    return `
-🚨 *NOUVEAU BET D'ARII DEFI*
-
-💰 *Montant:* ${bet.amount} ETH
-📊 *Marché:* ${bet.market || 'N/A'}
-⏰ *Timestamp:* ${new Date(bet.timestamp).toLocaleString('fr-FR')}
-
-🔗 [Voir sur Explorer](${bet.explorerUrl})
-
-💡 *Que veux-tu faire ?*
-`;
-}
-
-// Crée le clavier inline pour les actions
-function createBetKeyboard(betId) {
-    return {
-        inline_keyboard: [
-            [
-                { text: '✅ Copier ce Bet', callback_data: `copy_${betId}` },
-                { text: '❌ Ignorer', callback_data: `ignore_${betId}` }
-            ],
-            [
-                { text: '📊 Voir Détails', callback_data: `details_${betId}` }
-            ]
-        ]
-    };
-}
-
-// ============ COMMANDES DU BOT ============
-
-// Commande /start
-bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    users.set(chatId, {
-        notifications: true,
-        autoCopy: false,
-        copyAmount: null
-    });
-    
-    const welcomeMsg = `
-🎰 *Bienvenue sur Arii Copy Trader Bot!*
-
-Je surveille les bets d'Arii Defi sur Myriad (Abstract Chain) et te notifie en temps réel.
-
-*Commandes disponibles:*
-/help - Voir l'aide
-/status - État du monitoring
-/settings - Paramètres
-/history - Historique des bets
-/wallet - Connecter ton wallet
-
-*Statut:* 🟢 Monitoring actif
-*Wallet surveillé:* \`${ARII_WALLET}\`
-
-🔔 Tu recevras une notification à chaque nouveau bet!
-`;
-    
-    bot.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
-});
-
-// Commande /help
-bot.onText(/\/help/, (msg) => {
-    const chatId = msg.chat.id;
-    const helpMsg = `
-📖 *Guide d'Utilisation*
-
-*Notifications:*
-Tu reçois une alerte à chaque bet d'Arii avec:
-• Montant et marché
-• Lien vers l'explorateur
-• Boutons d'action rapide
-
-*Actions disponibles:*
-✅ *Copier* - Réplique le bet (wallet requis)
-❌ *Ignorer* - Ignore cette notification
-📊 *Détails* - Voir plus d'infos
-
-*Paramètres:*
-/settings - Active/désactive:
-  • Auto-copy (copie automatique)
-  • Montants personnalisés
-  • Notifications
-
-*Wallet:*
-/wallet - Connecte ton wallet pour copier les bets
-
-*Support:*
-En cas de problème, contacte @ton_username
-`;
-    
-    bot.sendMessage(chatId, helpMsg, { parse_mode: 'Markdown' });
-});
-
-// Commande /status
-bot.onText(/\/status/, async (msg) => {
-    const chatId = msg.chat.id;
-    
-    try {
-        const blockNumber = await provider.getBlockNumber();
-        const balance = await provider.getBalance(ARII_WALLET);
         
-        const statusMsg = `
-📊 *Statut du Système*
-
-🟢 *Monitoring:* Actif
-⛓️ *Blockchain:* Abstract (Chain ID: 2741)
-📦 *Dernier Block:* ${blockNumber}
-👤 *Wallet Arii:* \`${ARII_WALLET}\`
-💰 *Balance Arii:* ${ethers.formatEther(balance)} ETH
-📈 *Bets détectés:* ${activeBets.length}
-👥 *Utilisateurs actifs:* ${users.size}
-
-⏰ *Dernière vérification:* ${new Date().toLocaleString('fr-FR')}
-`;
-        
-        bot.sendMessage(chatId, statusMsg, { parse_mode: 'Markdown' });
     } catch (error) {
-        bot.sendMessage(chatId, '❌ Erreur lors de la récupération du statut');
+        console.error('❌ Erreur lors de la vérification:', error.message);
     }
-});
+}
 
-// Commande /settings
-bot.onText(/\/settings/, (msg) => {
-    const chatId = msg.chat.id;
-    const userSettings = users.get(chatId) || {};
+async function notifyAllUsers(bet) {
+    const message = `
+🚨 *NOUVEAU ${bet.action.toUpperCase()} D'ARII!*
+
+💰 *Montant:* ${bet.amount}
+📊 *Marché:* ${bet.market}
+⏰ *Détecté:* ${new Date().toLocaleTimeString('fr-FR')}
+
+🔗 [Voir sur Myriad](${MYRIAD_PROFILE_URL})
+`;
     
     const keyboard = {
         inline_keyboard: [
             [
-                { 
-                    text: userSettings.notifications ? '🔔 Notifs: ON' : '🔕 Notifs: OFF', 
-                    callback_data: 'toggle_notifs' 
-                }
+                { text: '📊 Ouvrir Myriad', url: MYRIAD_PROFILE_URL },
+                { text: '✅ J\'ai vu', callback_data: `seen_${bet.id}` }
             ],
             [
-                { 
-                    text: userSettings.autoCopy ? '✅ Auto-Copy: ON' : '❌ Auto-Copy: OFF', 
-                    callback_data: 'toggle_autocopy' 
-                }
-            ],
-            [
-                { text: '💰 Définir Montant', callback_data: 'set_amount' }
+                { text: '📝 Voir Détails', callback_data: `details_${bet.id}` }
             ]
         ]
     };
     
-    bot.sendMessage(chatId, '⚙️ *Paramètres*\n\nClique pour modifier:', {
-        parse_mode: 'Markdown',
-        reply_markup: keyboard
-    });
-});
-
-// Commande /history
-bot.onText(/\/history/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    if (activeBets.length === 0) {
-        bot.sendMessage(chatId, '📭 Aucun bet détecté pour le moment.');
-        return;
+    let notifiedCount = 0;
+    for (const [chatId, settings] of users.entries()) {
+        if (!settings.notifications) continue;
+        
+        try {
+            await bot.sendMessage(chatId, message, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard,
+                disable_web_page_preview: false
+            });
+            notifiedCount++;
+        } catch (error) {
+            console.log(`⚠️ Erreur notification ${chatId}:`, error.message);
+        }
     }
     
-    let historyMsg = '📜 *Historique des Bets d\'Arii*\n\n';
+    console.log(`📤 ${notifiedCount} utilisateur(s) notifié(s)`);
+}
+
+// ============ SERVEUR WEB ============
+
+app.get('/', (req, res) => {
+    const uptime = Math.floor(process.uptime() / 60);
+    const nextCheck = lastCheckTime ? 
+        new Date(lastCheckTime.getTime() + CHECK_INTERVAL) : 
+        new Date(Date.now() + CHECK_INTERVAL);
     
-    activeBets.slice(-10).forEach((bet, index) => {
-        historyMsg += `${index + 1}. ${bet.amount} ETH - ${new Date(bet.timestamp).toLocaleString('fr-FR')}\n`;
-    });
-    
-    bot.sendMessage(chatId, historyMsg, { parse_mode: 'Markdown' });
+    res.send(`
+        <html>
+        <head>
+            <title>Arii Copy Bot</title>
+            <meta http-equiv="refresh" content="30">
+            <style>
+                body { font-family: Arial; padding: 40px; background: #1a1a1a; color: #fff; }
+                .status-ok { color: #0f0; }
+                .status-info { color: #4da6ff; }
+                h1 { color: #4da6ff; }
+                .card { background: #2a2a2a; padding: 20px; border-radius: 10px; margin: 20px 0; }
+                .stat { margin: 10px 0; }
+            </style>
+        </head>
+        <body>
+            <h1>🤖 Bot Telegram Arii Copy Trader</h1>
+            
+            <div class="card">
+                <h2>📊 Statut</h2>
+                <div class="stat">✅ Status: <strong class="status-ok">ONLINE</strong></div>
+                <div class="stat">🔄 Monitoring: <strong class="status-ok">${monitoringActive ? 'ACTIF' : 'INACTIF'}</strong></div>
+                <div class="stat">👥 Utilisateurs: <strong>${users.size}</strong></div>
+                <div class="stat">⏰ Uptime: <strong>${uptime} minutes</strong></div>
+            </div>
+            
+            <div class="card">
+                <h2>🔍 Monitoring</h2>
+                <div class="stat">⏱️ Intervalle: <strong>5 minutes</strong></div>
+                <div class="stat">📅 Dernière vérif: <strong>${lastCheckTime ? lastCheckTime.toLocaleTimeString('fr-FR') : 'Jamais'}</strong></div>
+                <div class="stat">⏭️ Prochaine vérif: <strong>${nextCheck.toLocaleTimeString('fr-FR')}</strong></div>
+                <div class="stat">📊 Bets trackés: <strong>${knownBets.size}</strong></div>
+            </div>
+            
+            ${lastBetDetected ? `
+            <div class="card">
+                <h2>🎯 Dernier Bet Détecté</h2>
+                <div class="stat">💰 Montant: <strong>${lastBetDetected.amount}</strong></div>
+                <div class="stat">🎬 Action: <strong>${lastBetDetected.action}</strong></div>
+                <div class="stat">⏰ Détecté: <strong>${new Date(lastBetDetected.timestamp).toLocaleString('fr-FR')}</strong></div>
+            </div>
+            ` : ''}
+            
+            <div class="card">
+                <h2>📱 Utilisation</h2>
+                <ol>
+                    <li>Ouvre Telegram</li>
+                    <li>Cherche ton bot</li>
+                    <li>Lance /start</li>
+                    <li>Reçois les alertes automatiquement!</li>
+                </ol>
+                <p class="status-info">🔗 <a href="${MYRIAD_PROFILE_URL}" style="color: #4da6ff;">Voir le profil d'Arii</a></p>
+            </div>
+            
+            <p style="margin-top: 40px; color: #666;">Auto-refresh toutes les 30s</p>
+        </body>
+        </html>
+    `);
 });
 
-// Commande /wallet
-bot.onText(/\/wallet/, (msg) => {
+app.get('/stats', (req, res) => {
+    res.json({
+        status: 'online',
+        monitoring: monitoringActive,
+        users: users.size,
+        betsTracked: knownBets.size,
+        lastCheck: lastCheckTime,
+        uptime: Math.floor(process.uptime()),
+        lastBet: lastBetDetected
+    });
+});
+
+app.listen(PORT, () => {
+    console.log(`🌐 Serveur web sur le port ${PORT}`);
+});
+
+// ============ COMMANDES BOT ============
+
+bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    const walletMsg = `
-🔐 *Connexion Wallet*
+    const firstName = msg.from.first_name || 'ami';
+    
+    users.set(chatId, {
+        notifications: true,
+        joinedAt: Date.now()
+    });
+    
+    bot.sendMessage(chatId, `
+👋 *Bienvenue ${firstName}!*
 
-Pour copier les bets, tu dois connecter ton wallet.
+🎯 *Bot Arii Copy Trader - Alertes Auto*
 
-*Options:*
-1️⃣ *MetaMask* (recommandé)
-2️⃣ *WalletConnect*
-3️⃣ *Address manuelle*
+✅ Tu es maintenant inscrit aux alertes!
+🔔 Tu recevras une notification à chaque nouveau bet d'Arii
+⏱️ Vérification automatique toutes les 5 minutes
 
-🔗 Utilise le lien ci-dessous pour connecter:
-[Connecter Wallet](https://app.myriad.markets)
+📱 *Commandes:*
+/status - Voir le statut du monitoring
+/test - Tester une alerte
+/settings - Paramètres
+/help - Aide
 
-⚠️ *Sécurité:*
-• Ne partage JAMAIS ta seed phrase
-• Vérifie toujours les transactions
-• Ce bot ne stocke PAS tes clés privées
+🚀 *C'est tout!* Le bot surveille automatiquement.
+Tu n'as plus rien à faire, détends-toi! 😎
+`, { parse_mode: 'Markdown' });
+});
 
-Une fois connecté, reviens ici et utilise:
-/setaddress <ton_adresse>
+bot.onText(/\/status/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    const nextCheck = lastCheckTime ? 
+        new Date(lastCheckTime.getTime() + CHECK_INTERVAL) : 
+        new Date(Date.now() + CHECK_INTERVAL);
+    
+    const statusMsg = `
+📊 *STATUT DU BOT*
+
+🔄 *Monitoring:* ${monitoringActive ? '🟢 ACTIF' : '🔴 INACTIF'}
+⏱️ *Intervalle:* 5 minutes
+📅 *Dernière vérif:* ${lastCheckTime ? lastCheckTime.toLocaleTimeString('fr-FR') : 'Jamais'}
+⏭️ *Prochaine vérif:* ${nextCheck.toLocaleTimeString('fr-FR')}
+
+👥 *Utilisateurs actifs:* ${users.size}
+📊 *Bets trackés:* ${knownBets.size}
+⏰ *Uptime:* ${Math.floor(process.uptime() / 60)} minutes
+
+${lastBetDetected ? `
+🎯 *Dernier bet:*
+💰 ${lastBetDetected.amount}
+🎬 ${lastBetDetected.action}
+⏰ ${new Date(lastBetDetected.timestamp).toLocaleString('fr-FR')}
+` : '📭 Aucun bet détecté pour l\'instant'}
 `;
     
-    bot.sendMessage(chatId, walletMsg, { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, statusMsg, { parse_mode: 'Markdown' });
 });
 
-// Commande pour définir l'adresse
-bot.onText(/\/setaddress (.+)/, (msg, match) => {
+bot.onText(/\/test/, async (msg) => {
     const chatId = msg.chat.id;
-    const address = match[1];
     
-    if (!ethers.isAddress(address)) {
-        bot.sendMessage(chatId, '❌ Adresse invalide. Format attendu: 0x...');
-        return;
-    }
+    const testBet = {
+        id: `test_${Date.now()}`,
+        amount: '0.5 ETH',
+        action: 'Achat',
+        market: 'Bitcoin > $100k en 2025',
+        timestamp: Date.now()
+    };
     
-    const userSettings = users.get(chatId) || {};
-    userSettings.walletAddress = address;
-    users.set(chatId, userSettings);
+    const message = `
+🧪 *ALERTE TEST*
+
+🚨 *NOUVEL ACHAT D'ARII!*
+
+💰 *Montant:* ${testBet.amount}
+📊 *Marché:* ${testBet.market}
+⏰ *Détecté:* ${new Date().toLocaleTimeString('fr-FR')}
+
+🔗 [Voir sur Myriad](${MYRIAD_PROFILE_URL})
+
+_Ceci est une alerte de test. Les vraies alertes auront le même format!_
+`;
     
-    bot.sendMessage(chatId, `✅ Wallet connecté: \`${address}\`\n\nTu peux maintenant copier les bets!`, {
-        parse_mode: 'Markdown'
+    bot.sendMessage(chatId, message, { 
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [[
+                { text: '📊 Ouvrir Myriad', url: MYRIAD_PROFILE_URL }
+            ]]
+        }
     });
 });
 
-// ============ GESTION DES CALLBACKS ============
+bot.onText(/\/help/, (msg) => {
+    const chatId = msg.chat.id;
+    
+    bot.sendMessage(chatId, `
+📖 *AIDE COMPLÈTE*
+
+🤖 *Comment ça marche?*
+Le bot vérifie automatiquement le profil d'Arii toutes les 5 minutes. Dès qu'un nouveau bet est détecté, tu reçois une alerte instantanée!
+
+🔔 *Notifications:*
+• Automatiques toutes les 5 min
+• Infos: montant, marché, action
+• Lien direct vers Myriad
+
+📱 *Commandes:*
+/start - S'inscrire
+/status - Voir le statut
+/test - Tester une alerte
+/settings - Paramètres
+/help - Cette aide
+
+⚙️ *Paramètres:*
+Utilise /settings pour activer/désactiver les notifications
+
+🆘 *Problème?*
+Si tu ne reçois pas d'alertes, vérifie que:
+1. Tu as fait /start
+2. Les notifications sont activées
+3. Le bot est en ligne (/status)
+
+🔗 *Liens:*
+[Profil Arii](${MYRIAD_PROFILE_URL})
+[Myriad Markets](https://myriad.markets)
+`, { 
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+    });
+});
+
+bot.onText(/\/settings/, (msg) => {
+    const chatId = msg.chat.id;
+    const settings = users.get(chatId) || { notifications: true };
+    
+    bot.sendMessage(chatId, 
+        `⚙️ *PARAMÈTRES*\n\nClique pour modifier:`,
+        {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [[
+                    { 
+                        text: settings.notifications ? '🔔 Notifs: ON' : '🔕 Notifs: OFF', 
+                        callback_data: 'toggle_notifs' 
+                    }
+                ]]
+            }
+        }
+    );
+});
+
+// ============ CALLBACKS ============
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
-    const userSettings = users.get(chatId) || {};
     
-    // Toggle notifications
     if (data === 'toggle_notifs') {
-        userSettings.notifications = !userSettings.notifications;
-        users.set(chatId, userSettings);
+        const settings = users.get(chatId) || { notifications: true };
+        settings.notifications = !settings.notifications;
+        users.set(chatId, settings);
+        
         bot.answerCallbackQuery(query.id, {
-            text: `Notifications ${userSettings.notifications ? 'activées' : 'désactivées'}!`
+            text: `Notifications ${settings.notifications ? 'activées ✅' : 'désactivées ❌'}!`
         });
-        bot.sendMessage(chatId, `/settings`, { parse_mode: 'Markdown' });
-    }
-    
-    // Toggle auto-copy
-    else if (data === 'toggle_autocopy') {
-        if (!userSettings.walletAddress) {
-            bot.answerCallbackQuery(query.id, {
-                text: 'Connecte d\'abord ton wallet avec /wallet',
-                show_alert: true
-            });
-            return;
+        
+        bot.editMessageText(
+            `⚙️ *PARAMÈTRES*\n\nNotifications: ${settings.notifications ? '🔔 ON' : '🔕 OFF'}`,
+            {
+                chat_id: chatId,
+                message_id: query.message.message_id,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { 
+                            text: settings.notifications ? '🔔 Notifs: ON' : '🔕 Notifs: OFF', 
+                            callback_data: 'toggle_notifs' 
+                        }
+                    ]]
+                }
+            }
+        );
+    } else if (data.startsWith('seen_')) {
+        bot.answerCallbackQuery(query.id, { text: '✅ Noté!' });
+    } else if (data.startsWith('details_')) {
+        if (lastBetDetected) {
+            bot.sendMessage(chatId, 
+                `📝 *Détails:*\n\n${lastBetDetected.fullText || 'Pas de détails supplémentaires'}`,
+                { parse_mode: 'Markdown' }
+            );
         }
-        userSettings.autoCopy = !userSettings.autoCopy;
-        users.set(chatId, userSettings);
-        bot.answerCallbackQuery(query.id, {
-            text: `Auto-copy ${userSettings.autoCopy ? 'activé' : 'désactivé'}!`
-        });
-    }
-    
-    // Copier un bet
-    else if (data.startsWith('copy_')) {
-        const betId = data.replace('copy_', '');
-        const bet = activeBets.find(b => b.id === betId);
-        
-        if (!userSettings.walletAddress) {
-            bot.answerCallbackQuery(query.id, {
-                text: 'Connecte d\'abord ton wallet avec /wallet',
-                show_alert: true
-            });
-            return;
-        }
-        
-        if (!bet) {
-            bot.answerCallbackQuery(query.id, { text: 'Bet introuvable' });
-            return;
-        }
-        
-        bot.sendMessage(chatId, `
-🔄 *Copie du Bet en cours...*
-
-💰 Montant: ${bet.amount} ETH
-📊 Marché: ${bet.market}
-
-⚠️ *Instructions:*
-1. Va sur Myriad: [myriad.markets](https://myriad.markets)
-2. Connecte ton wallet: \`${userSettings.walletAddress}\`
-3. Trouve ce marché et place le même bet
-
-📝 *Note:* L'exécution automatique arrive bientôt!
-`, { parse_mode: 'Markdown' });
-        
-        bot.answerCallbackQuery(query.id, { text: '✅ Instructions envoyées!' });
-    }
-    
-    // Ignorer un bet
-    else if (data.startsWith('ignore_')) {
-        bot.answerCallbackQuery(query.id, { text: 'Bet ignoré' });
-        bot.deleteMessage(chatId, query.message.message_id);
-    }
-    
-    // Détails d'un bet
-    else if (data.startsWith('details_')) {
-        const betId = data.replace('details_', '');
-        const bet = activeBets.find(b => b.id === betId);
-        
-        if (!bet) {
-            bot.answerCallbackQuery(query.id, { text: 'Bet introuvable' });
-            return;
-        }
-        
-        const detailsMsg = `
-📊 *Détails du Bet*
-
-🆔 *ID:* \`${bet.id.slice(0, 10)}...\`
-💰 *Montant:* ${bet.amount} ETH
-📍 *Marché:* \`${bet.market}\`
-⏰ *Date:* ${new Date(bet.timestamp).toLocaleString('fr-FR')}
-
-🔗 *Liens:*
-[Voir Transaction](${bet.explorerUrl})
-[Voir sur Myriad](https://myriad.markets)
-`;
-        
-        bot.sendMessage(chatId, detailsMsg, { parse_mode: 'Markdown' });
         bot.answerCallbackQuery(query.id);
     }
 });
 
-// ============ MONITORING EN TEMPS RÉEL ============
+// ============ GESTION ERREURS ============
 
-let isMonitoring = false;
-
-async function startMonitoring() {
-    if (isMonitoring) return;
-    isMonitoring = true;
-    
-    console.log('🚀 Monitoring démarré pour Arii Defi...');
-    console.log(`👤 Wallet surveillé: ${ARII_WALLET}`);
-    console.log(`⏱️ Vérification toutes les 30 secondes`);
-    
-    // Test initial de connexion
-    try {
-        const blockNumber = await provider.getBlockNumber();
-        console.log(`✅ Connecté à Abstract - Bloc actuel: ${blockNumber}`);
-    } catch (error) {
-        console.log('⚠️ Connexion RPC en cours...');
-    }
-    
-    setInterval(async () => {
-        try {
-            // Récupère l'activité d'Arii
-            const activity = await fetchAriiActivity();
-            
-            if (!activity || activity.length === 0) return;
-            
-            // Traite chaque nouvelle transaction
-            for (const tx of activity) {
-                const betInfo = parseBetTransaction(tx);
-                
-                // Vérifie si c'est un nouveau bet
-                if (!activeBets.find(b => b.id === betInfo.id)) {
-                    activeBets.push(betInfo);
-                    
-                    console.log(`✅ Nouveau bet détecté: ${betInfo.id}`);
-                    
-                    // Notifie tous les utilisateurs
-                    for (const [chatId, settings] of users.entries()) {
-                        if (!settings.notifications) continue;
-                        
-                        const message = formatBetNotification(betInfo);
-                        const keyboard = createBetKeyboard(betInfo.id);
-                        
-                        try {
-                            await bot.sendMessage(chatId, message, {
-                                parse_mode: 'Markdown',
-                                reply_markup: keyboard
-                            });
-                            
-                            // Auto-copy si activé
-                            if (settings.autoCopy && settings.walletAddress) {
-                                await bot.sendMessage(chatId, '🤖 Auto-copy activé! Instructions envoyées...');
-                            }
-                        } catch (err) {
-                            console.log(`⚠️ Erreur envoi notification à ${chatId}`);
-                        }
-                    }
-                }
-            }
-        } catch (error) {
-            // Erreur silencieuse pour ne pas spammer les logs
-            if (Math.random() < 0.1) { // Log 10% des erreurs seulement
-                console.log('⚠️ Erreur monitoring (normal si pas d\'activité)');
-            }
-        }
-    }, 30000); // Vérification toutes les 30 secondes (moins agressif)
-}
-
-// ============ DÉMARRAGE ============
-
-console.log('🤖 Bot Telegram Arii Copy Trader démarré!');
-console.log(`📱 Token: ${TELEGRAM_BOT_TOKEN.slice(0, 20)}...`);
-console.log(`⛓️ RPC: ${ABSTRACT_RPC_URL}`);
-console.log(`👤 Wallet Arii: ${ARII_WALLET}`);
-
-startMonitoring();
-
-// Message de bienvenue dans la console
-bot.getMe().then(me => {
-    console.log(`✅ Bot connecté: @${me.username}`);
-    console.log('📡 En attente de messages...');
-});
-
-// Gestion des erreurs
 bot.on('polling_error', (error) => {
-    console.error('Erreur polling:', error.message);
+    console.error('❌ Erreur polling:', error.message);
 });
 
 process.on('SIGINT', () => {
     console.log('\n👋 Arrêt du bot...');
     bot.stopPolling();
     process.exit(0);
+});
+
+// ============ DÉMARRAGE ============
+
+console.log('🤖 Bot Telegram Arii Copy Trader');
+console.log(`📱 Token: ${TELEGRAM_BOT_TOKEN.slice(0, 20)}...`);
+console.log(`👤 Wallet Arii: ${ARII_WALLET}`);
+console.log(`🌐 Port: ${PORT}`);
+console.log(`⏱️ Intervalle de vérification: ${CHECK_INTERVAL / 60000} minutes`);
+
+bot.getMe().then(me => {
+    console.log(`✅ Bot connecté: @${me.username}`);
+    console.log('📡 En attente de messages...');
+    
+    // Démarre le monitoring automatique
+    setTimeout(() => {
+        startMonitoring();
+    }, 3000); // Attends 3 secondes avant de démarrer
 });
