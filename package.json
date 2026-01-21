@@ -5,7 +5,8 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "dev": "nodemon bot.js",
+    "postinstall": "echo '✅ Dépendances installées avec succès!'"
   },
   "keywords": [
     "telegram",
